@@ -21,14 +21,6 @@ $ ./cl-xtdb [name]
 Hello [name] from cl-xtdb
 ```
 
-## Roswell integration
-
-Roswell is an implementation manager and [script launcher](https://github.com/roswell/roswell/wiki/Roswell-as-a-Scripting-Environment).
-
-A POC script is in the roswell/ directory.
-
-Your users can install the script with `js./cl-xtdb`.
-
 # Dev
 
 Tests are defined with [Fiveam](https://common-lisp.net/project/fiveam/docs/).
