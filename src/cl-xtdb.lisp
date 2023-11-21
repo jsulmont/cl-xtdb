@@ -1,7 +1,25 @@
 (in-package :cl-xtdb)
 
-(defparameter *headers* '(("Accept" . "application/transit+json")
-                          ("Content-Type" . "application/transit+json")))
+;; "A class representing a client for  XTDB2. It stores the base and
+;;  derived URLs (transactions, queries, and status). The class also
+;;  keeps track of the latest submitted tx (by this client) and the
+;;  thread that owns this instance."
+(defclass xtdb-http-client ()
+  ((url :initarg :url :reader url)
+   (tx-url :accessor tx-url :initform nil)
+   (query-url :accessor query-url :initform nil)
+   (status-url :accessor status-url :initform nil)
+   (latest-submitted-tx :accessor latest-submitted-tx :initform nil)
+   (owner :accessor owner :initform (bt:current-thread))
+   (http-stream :accessor http-stream :initform nil)))
+
+
+(defmethod initialize-instance :after ((client xtdb-http-client) &key)
+  (with-slots (url tx-url query-url status-url http-stream) client
+    (setf tx-url (format nil "~a/tx" url)
+          query-url (format nil "~a/query" url)
+          status-url (format nil "~a/status" url)
+          http-stream (nth-value 4 (drakma:http-request status-url :close nil)))))
 
 (defmethod print-object ((object hash-table) stream)
   (format stream "#HASH{~{~{(~a : ~a)~}~^ ~}}"
@@ -9,28 +27,28 @@
                   using (hash-value value)
                 collect (list key value))))
 
-;; "A class representing a client for the XTDB database.
-;;  It stores the base URL and the derived URIs for transactions, queries,
-;;  and status operations. The class also keeps track of the latest
-;;  submitted transaction and the thread that owns the client instance."
-(defclass xtdb-http-client ()
-  ((url :initarg :url :reader url)
-   (tx-uri :accessor tx-uri :initform nil)
-   (query-uri :accessor query-uri :initform nil)
-   (status-uri :accessor status-uri :initform nil)
-   (latest-submitted-tx :accessor latest-submitted-tx :initform nil)
-   (owner :accessor owner :initform (bt:current-thread))))
+(defparameter *http-client-format*
+  "#<~a url: ~a stream: ~a latest-submitted-tx: ~a>")
 
+(defun stream-status (stream)
+  (let ((status nil))
+    (if (open-stream-p stream)
+        (progn
+          (when (output-stream-p stream)
+            (push :OUTPUT status))
+          (when (input-stream-p stream)
+            (push :INPUT status)))
+        (push :CLOSED status))))
 
-(defmethod initialize-instance :after ((client xtdb-http-client) &key)
-  (with-slots (url tx-uri query-uri status-uri) client
-    (setf tx-uri (format nil "~a/tx" url)
-          query-uri (format nil "~a/query" url)
-          status-uri (format nil "~a/status" url))))
+(defmethod print-object ((client xtdb-http-client) out)
+  (with-slots (url latest-submitted-tx http-stream)
+      client
+    (format out *http-client-format*
+            (type-of client) url (stream-status http-stream)
+            latest-submitted-tx)))
 
-;;=> body-or-stream0, status-code1, headers2, uri3, stream4, must-close5, reason-phrase6
-(defun make-xtdb-http-client (uri)
-  (make-instance 'xtdb-http-client :url uri))
+(defun make-xtdb-http-client (url)
+  (make-instance 'xtdb-http-client :url url))
 
 (define-condition not-owner-error (error)
   ((text :initarg :text :reader text)))
@@ -41,30 +59,19 @@
 
 (defmethod print-object ((e xtdb-error) out)
   "Initializes an instance of xtdb-http-client,
-   setting up URIs for transaction, query,
+   setting up URLs for transaction, query,
    and status based on the base URL."
   (with-slots (code reason) e
     (format out "#<XTDB-ERROR code: ~a reason: ~a>"
             code reason)))
 
 (defmethod status ((client xtdb-http-client))
-  (with-slots (status-uri) client
+  (with-slots (status-url) client
     (multiple-value-bind (body status)
-        (drakma:http-request status-uri)
+        (drakma:http-request status-url)
       (if (= 200 status)
           (clt:decode-json body)
           (error 'http-failed :status status)))))
-
-(defparameter *http-client-format*
-  "#<~a~% tx-uri: ~a~% query-uri: ~a~% status-uri: ~a~% latest-submitted-tx: ~a~%>")
-
-(defmethod print-object ((client xtdb-http-client) out)
-  (with-slots (tx-uri query-uri status-uri
-               latest-submitted-tx http-stream)
-      client
-    (format out *http-client-format*
-            (type-of client) tx-uri query-uri
-            status-uri latest-submitted-tx)))
 
 ;; TODO Slime etc
 (defvar *whitelisted-threads* (list "slynk-worker")
@@ -137,14 +144,23 @@
             collect (clt:decode
                      (jzon:parse s :allow-multiple-content t))))))
 
-(defun post (tx-uri content)
-  (multiple-value-bind (body status headers uri stream close? reason)
-      (drakma:http-request tx-uri
+(defun dump-payload (payload &optional (path #P"/tmp/payload.transit"))
+  (with-open-file (file path :direction :output
+                             :if-exists :append
+                             :if-does-not-exist :create)
+    (write-line (prin1-to-string payload) file)))
+
+(defun post (tx-url content http-stream)
+  ;;(dump-payload content)
+  (multiple-value-bind (body status headers url stream close? reason)
+      (drakma:http-request tx-url
                            :method :post
+                           :stream http-stream
                            :accept "application/transit+json"
                            :content-type "application/transit+json"
+                           :close nil
                            :content content)
-    (declare (ignore headers uri stream close?))
+    (declare (ignore headers url stream close?))
     (values body status reason)))
 
 (defmethod submit-tx ((client xtdb-http-client) tx-ops)
@@ -152,9 +168,9 @@
   (ensure-local client)
   (let* ((tx (dict :|tx-ops| tx-ops))
          (content (clt:encode-json tx)))
-    (with-slots (tx-uri) client
+    (with-slots (tx-url http-stream) client
       (multiple-value-bind (body code reason)
-          (post tx-uri content)
+          (post tx-url content http-stream)
         (if (/= code 200)
             (error 'xtdb-error :code  code :reason reason)
             (let ((tx-key (car (decode-body body))))
@@ -170,57 +186,87 @@
   (make-instance
    'cl-transit:tagged-value :tag "xtdb/list"  :rep (lisp-to-edn rep)))
 
-(defmethod query ((client xtdb-http-client) query-map &key tx-key)
-  (check-type query-map hash-table)
-  (let* ((q (if tx-key (dict :|query| query-map
-                             :|basis| (dict :|tx| tx-key)
-                             :|default-all-valid-time?| nil)
-                (dict :|query| query-map)))
+(defun build-query (query-map basis basis-timeout args default-all-valid-time? default-tz)
+  (let ((result (dict :|query| query-map)))
+    (when basis
+      (setf result (merge-hash-tables
+                    result (dict :|basis| basis))))
+    (when basis-timeout
+      (setf result (merge-hash-tables
+                    result (dict :|basis-timeout| basis-timeout))))
+    (when args
+      (setf result (merge-hash-tables
+                    result (dict :|args| args))))
+    (when default-all-valid-time?
+      (setf result (merge-hash-tables
+                    result (dict :|default-all-valid-time?|
+                                 default-all-valid-time?))))
+    (when default-all-valid-time?
+      (setf result (merge-hash-tables
+                    result (dict :|default-tz| default-tz))))
+    result))
+
+(defmethod query ((client xtdb-http-client) query-map
+                  &key basis basis-timeout args default-all-valid-time? default-tz )
+  (check-type query-map hash-table) ;; TODO check keyed args
+  (let* ((q (build-query query-map basis basis-timeout args default-all-valid-time? default-tz))
          (content (clt:encode-json q)))
-    (multiple-value-bind (body code reason)
-        (post (slot-value client 'query-uri) content)
-      (if (/= code 200)
-          (error 'xtdb-error :code code :reason reason)
-          (decode-body body)))))
+    (with-slots (query-url http-stream) client
+      (multiple-value-bind (body code reason)
+          (post query-url content http-stream)
+        (if (/= code 200)
+            (error 'xtdb-error :code code :reason reason)
+            (decode-body body))))))
 
-(defun test ()
-  (let*  ((node (make-xtdb-http-client "http://localhost:3000"))
-          (xt-id (uuid:make-v4-uuid))
-          (tx-key (submit-tx node
-                             (vect (vect :|put| :|clock|
-                                         (dict :|xt/id| xt-id
-                                               :|user-id| (uuid:make-v4-uuid)
-                                               :|text| "yeayayaya"))))))
-    (query node
-           (dict
-            :|find| (vect 'x)
-            :|where| (vect (xtdb/list
-                            '$
-                            :|clock| (dict :|xt/*| 'x))))
-           :tx-key tx-key)
-
-
-    ))
+(defun %main (argv)
+  (let ((node (make-xtdb-http-client "http://localhost:3000"))
+        (count 0) (found 0)
+        (table (if (first argv)
+                   (intern (string-left-trim ":" (first argv)) :keyword)
+                   :|clock|)))
+    (format t "--> table: ~a~%" table)
+    (loop
+      (let* ((key (uuid:make-v4-uuid))
+             (tx-key (submit-tx
+                      node
+                      (vect (vect :|put| table
+                                  (dict :|xt/id| key
+                                        :|user-id| (uuid:make-v4-uuid)
+                                        :|text| "yeayayaya")))))
+             (res (query node
+                         (dict
+                          :|find| (vect 'x)
+                          :|where| (vect (xtdb/list
+                                          '$
+                                          table (dict :|xt/*| 'x
+                                                      :|xt/id| key))))
+                         :basis (dict :|tx| tx-key)
+                         )))
+        (unless (zerop (length res))
+          (incf found))
+        (sleep 0.01)
+        (when (= 0 (mod (incf count) 0))
+          (format t "--> count=~a found=~a ~%"
+                  count found))))))
 
 (defun main ()
-  (let ((node (make-xtdb-http-client "http://localhost:3000"))
-        (count 0))
-    (loop
-      (submit-tx node
-                 (vect (vect :|put| :|clock|
-                             (dict :|xt/id| (uuid:make-v4-uuid)
-                                   :|user-id| (uuid:make-v4-uuid)
-                                   :|text| "yeayayaya"))))
+  (%main (uiop:command-line-arguments)))
 
-      (sleep 0.01)
-      (when (= 0 (mod (incf count) 10))
-        (format t "--> ~a ~%" count)))))
+(defparameter *node* (make-xtdb-http-client "http://localhost:3000"))
 
-;; (defun main ()
-;;   "Entry point for the executable.
-;;    Reads command line arguments."
-;;   ;; uiop:command-line-arguments returns a list of arguments (sans the script name).
-;;   ;; We defer the work of parsing to %main because we call it also from the Roswell script.
-;;   (format t "~a~%" (test))
-;;   (uiop:quit)
-;;   )
+#+_x(let* ((key (uuid:make-v4-uuid))
+           (tx-key (submit-tx
+                    *node*
+                    (vect (vect :|put| :lolaxx
+                                (dict :|xt/id| key
+                                      :|user-id| (uuid:make-v4-uuid)
+                                      :|text| "yeayayaya")))))
+           (res (query *node*
+                       (dict
+                        :|find| (vect 'x)
+                        :|where| (vect (xtdb/list
+                                        '$
+                                        :lolaxx (dict :|xt/*| 'x
+                                                      :|xt/id| key))))
+                       :basis (dict :|tx| tx-key))))
+      (format t "--> result ~a~%" res))
