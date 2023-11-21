@@ -12,11 +12,11 @@
   ;; Dependencies.
   :depends-on (:cl-transit
                :alexandria
-               :babel
+               :dexador
                :flexi-streams
                :serapeum
+               :rutils
                :arrow-macros
-               :cffi
                :bordeaux-threads
                :com.inuoe.jzon
                :uuid
